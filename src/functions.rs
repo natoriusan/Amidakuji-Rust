@@ -3,6 +3,7 @@ use std::fs::File;
 use std::time::{Duration, Instant};
 use std::thread;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use rand::SeedableRng;
 use rand::distributions::{Distribution, Uniform};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -39,7 +40,9 @@ fn check_fair (goals: Vec<usize>, vertical: usize, count: usize) -> bool {
 }
 
 
-pub(crate) fn normal_amidakuji (vertical_range: impl Iterator<Item = usize> + Clone, count: usize, accuracy: usize, acc_base: f64, thread_count: usize) -> AmidakujiResult {
+
+#[inline(always)]
+fn amidakuji_body (vertical_range: impl Iterator<Item = usize> + Clone, count: usize, accuracy: usize, acc_base: f64, thread_count: usize, f: impl Fn(usize, u64) -> JoinHandle<Vec<usize>>) -> AmidakujiResult {
     let time = Instant::now();
     let range_length = vertical_range.clone().count();
     let digits = range_length.to_string().len();
@@ -61,39 +64,21 @@ pub(crate) fn normal_amidakuji (vertical_range: impl Iterator<Item = usize> + Cl
     let result =
         vertical_range.enumerate().map(|(nth, vertical)| {
             let mut needed_horizontal = 0;
-    
+
             let mut last_index = 0.;
             let mut index = 1.;
             for i in 0..accuracy {
                 let horizontal = acc_base.powf(index).floor() as u64;
-    
+
                 let mut handlers = vec![];
                 for _ in 0..thread_count {
-                    handlers.push(thread::spawn(move || {
-                        let mut rng = Xoshiro256PlusPlus::from_entropy();
-                        let range = Uniform::new(0, vertical-1);
-                        let mut goals = vec![0_usize; vertical];
-                        // When count % thread_count != 0, total trial != count
-                        for _ in 0..count/thread_count {
-                            let mut current_pos = 0;
-                            for _ in 0..horizontal {
-                                let line = range.sample(&mut rng);
-                                if current_pos == line {
-                                    current_pos += 1;
-                                } else if current_pos == line + 1 {
-                                    current_pos -= 1;
-                                }
-                            }
-                            goals[current_pos] += 1;
-                        }
-                        goals
-                    }));
+                    handlers.push(f(vertical, horizontal));
                 }
-                
+
                 let goals = handlers.into_iter().fold(vec![0; vertical], |prev, x| {
                     x.join().unwrap().iter().zip(prev).map(|(a, b)| a + b).collect()
                 });
-    
+
                 if check_fair(goals, vertical, count) {
                     needed_horizontal = horizontal;
                     index = (last_index + index) / 2.;
@@ -115,4 +100,90 @@ pub(crate) fn normal_amidakuji (vertical_range: impl Iterator<Item = usize> + Cl
     };
     println!("\r\x1b[2K{0} / {0} [\x1b[32mFinished\x1b[0m] {1}", range_length, result.fmt_elapsed());
     result
+}
+
+#[allow(dead_code)]
+pub(crate) fn normal_amidakuji (vertical_range: impl Iterator<Item = usize> + Clone, count: usize, accuracy: usize, acc_base: f64, thread_count: usize) -> AmidakujiResult {
+    amidakuji_body(vertical_range, count, accuracy, acc_base, thread_count, |vertical, horizontal| {
+        thread::spawn(move || {
+            let mut rng = Xoshiro256PlusPlus::from_entropy();
+            let range = Uniform::new(0, vertical-1);
+            let mut goals = vec![0_usize; vertical];
+            // When count % thread_count != 0, total trial != count
+            for _ in 0..count/thread_count {
+                let mut current_pos = 0;
+                for _ in 0..horizontal {
+                    let line = range.sample(&mut rng);
+                    if current_pos == line {
+                        current_pos += 1;
+                    } else if current_pos == line + 1 {
+                        current_pos -= 1;
+                    }
+                }
+                goals[current_pos] += 1;
+            }
+            goals
+        })
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn connected_amidakuji (vertical_range: impl Iterator<Item = usize> + Clone, count: usize, accuracy: usize, acc_base: f64, thread_count: usize) -> AmidakujiResult {
+    amidakuji_body(vertical_range, count, accuracy, acc_base, thread_count, |vertical, horizontal| {
+        thread::spawn(move || {
+            let mut rng = Xoshiro256PlusPlus::from_entropy();
+            let range = Uniform::new(0, vertical);
+            let mut goals = vec![0_usize; vertical];
+            // When count % thread_count != 0, total trial != count
+            for _ in 0..count/thread_count {
+                let mut current_pos = 0;
+                for _ in 0..horizontal {
+                    let line = range.sample(&mut rng);
+                    if line == vertical - 1 {
+                        if current_pos == 0 {
+                            current_pos = vertical - 1;
+                        } else if current_pos == vertical - 1 {
+                            current_pos = 0;
+                        }
+                    } else if current_pos == line {
+                        current_pos += 1;
+                    } else if current_pos == line + 1 {
+                        current_pos -= 1;
+                    }
+                }
+                goals[current_pos] += 1;
+            }
+            goals
+        })
+    })
+}
+
+
+#[allow(dead_code)]
+pub(crate) fn connected_amidakuji_with_long_horizontal (vertical_range: impl Iterator<Item = usize> + Clone, count: usize, accuracy: usize, acc_base: f64, thread_count: usize) -> AmidakujiResult {
+    amidakuji_body(vertical_range, count, accuracy, acc_base, thread_count, |vertical, horizontal| {
+        thread::spawn(move || {
+            let mut rng = Xoshiro256PlusPlus::from_entropy();
+            let range = Uniform::new(0, vertical);
+            let mut goals = vec![0_usize; vertical];
+            // When count % thread_count != 0, total trial != count
+            for _ in 0..count/thread_count {
+                let mut current_pos = 0;
+                for _ in 0..horizontal {
+                    let l = range.sample(&mut rng);
+                    let mut r = range.sample(&mut rng);
+                    while l == r {
+                        r = range.sample(&mut rng);
+                    }
+                    if current_pos == l {
+                        current_pos = r;
+                    } else if current_pos == r {
+                        current_pos = l;
+                    }
+                }
+                goals[current_pos] += 1;
+            }
+            goals
+        })
+    })
 }
