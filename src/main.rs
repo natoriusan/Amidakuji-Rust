@@ -1,6 +1,8 @@
+use crate::functions::*;
+
 mod functions;
 
 fn main() {
-    let results = functions::connected_amidakuji_with_long_horizontal(3..=40, 1000000, 22, 3., 6);
-    results.output("output/amidakuji.csv");
+    let results = construct_connected_amidakuji_with_long_line().calculate_parallel(3..=500);
+    results.output_to_file("output/amidakuji.csv");
 }
