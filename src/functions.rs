@@ -1,38 +1,305 @@
 #![allow(dead_code)]
 
+use std::cmp::Ordering;
+use std::cmp::Ordering::{Equal, Greater, Less};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{stdout, Write};
+use std::ops::{AddAssign, MulAssign, ShlAssign};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use itertools::Itertools;
-use rug::{Complete, Integer};
+
+
+#[derive(Clone, Debug)] 
+pub(crate) struct BaseN {
+    mantissa: VecDeque<usize>,
+    exponent: usize,
+    base: usize,
+    accuracy: usize,
+    max_error: usize
+}
+
+impl BaseN {
+    fn new(base: usize, accuracy: usize, value: usize) -> Self {
+        let mut num =
+            Self {
+                mantissa: VecDeque::from([value]),
+                exponent: 0,
+                base,
+                accuracy,
+                max_error: 0
+            };
+        num.fix_digits();
+        num.round_down();
+        num
+    }
+
+    fn adjust_exponent(&mut self, exponent: usize) {
+        for _ in 0..self.exponent.saturating_sub(exponent) {
+            self.mantissa.push_front(0);
+        }
+        self.exponent = self.exponent.min(exponent);
+    }
+
+    fn fix_digits(&mut self) {
+        fix_digits(&mut self.mantissa, self.base);
+        // let mut i = 0;
+        // while i < self.mantissa.len() {
+        //     if self.mantissa[i] >= self.base {
+        //         if i == self.mantissa.len() - 1 {
+        //             self.mantissa.push_back(0);
+        //         }
+        //         self.mantissa[i+1] += self.mantissa[i] / self.base;
+        //         self.mantissa[i] %= self.base;
+        //     }
+        //     i += 1;
+        // }
+    }
+
+    fn round_down(&mut self) {
+        self.exponent += self.mantissa.len().saturating_sub(self.accuracy);
+        for _ in 0..self.mantissa.len().saturating_sub(self.accuracy) {
+            self.mantissa.pop_front();
+        }
+    }
+    
+    fn get_error_max(&self) -> Self {
+        let mut num = self.clone();
+        while num.mantissa.len() < self.max_error + 1 {
+            num.mantissa.push_back(0);
+        }
+        num.mantissa[self.max_error] += 1;
+        num.fix_digits();
+        num
+    }
+}
+
+impl ShlAssign<usize> for BaseN {
+    fn shl_assign(&mut self, rhs: usize) {
+        self.exponent += rhs;
+    }
+}
+
+impl AddAssign<&BaseN> for BaseN {
+    fn add_assign(&mut self, rhs: &BaseN) {
+        debug_assert_eq!(self.base, rhs.base);
+        debug_assert_eq!(self.accuracy, rhs.accuracy);
+        let lhs_length = self.mantissa.len();
+        let lhs_exponent = self.exponent;
+        self.adjust_exponent(rhs.exponent);
+        for (i, x) in rhs.mantissa.iter().enumerate() {
+            while i + (rhs.exponent - self.exponent) >= self.mantissa.len() {
+                self.mantissa.push_back(0);
+            }
+            self.mantissa[i + (rhs.exponent - self.exponent)] += x;
+        }
+        self.fix_digits();
+        self.max_error = self.max_error.max(rhs.max_error);
+        if !(self.mantissa.len() <= self.accuracy && (self.exponent == 0 || rhs.exponent == 0)) {
+            self.max_error = self.max_error.max(
+                (self.mantissa.len() + self.exponent).abs_diff(
+                    rhs.mantissa.len() + rhs.exponent
+                )
+            );
+            self.max_error = self.max_error.max(
+                (self.mantissa.len() + self.exponent).abs_diff(
+                    lhs_length + lhs_exponent
+                )
+            );
+        }
+        self.round_down()
+    }
+}
+
+impl MulAssign<usize> for BaseN {
+    fn mul_assign(&mut self, rhs: usize) {
+        self.mantissa.iter_mut().for_each(|x| *x *= rhs);
+        self.fix_digits();
+    }
+}
+
+impl PartialEq for BaseN {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Equal
+    }
+}
+
+impl Eq for BaseN {
+
+}
+
+impl PartialOrd for BaseN {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BaseN {
+    fn cmp(&self, other: &Self) -> Ordering {
+        debug_assert_eq!(self.base, other.base);
+        debug_assert_eq!(self.accuracy, other.accuracy);
+
+        match (self.mantissa.len() + self.exponent).cmp(&(other.mantissa.len() + other.exponent)) {
+            Equal => {
+                self.mantissa.iter().rev()
+                    .zip_longest(other.mantissa.iter().rev())
+                    .map(|x| (x.clone().left().unwrap_or(&0), x.right().unwrap_or(&0)))
+                    .find_map(|(x, y)| {
+                        match x.cmp(y) {
+                            Equal => None,
+                            ord => Some(ord)
+                        }
+                    })
+                    .unwrap_or(Equal)
+            }
+            ord => ord
+        }
+    }
+}
+
+
+#[derive(Debug)]
+struct OnlyShift {
+    mantissa: VecDeque<usize>,
+    exponent: usize,
+    base: usize
+}
+
+impl OnlyShift {
+    fn new(base: usize, value: usize) -> Self {
+        let mut num =
+            Self {
+                mantissa: VecDeque::from([value]),
+                exponent: 0,
+                base
+            };
+        num.fix_digits();
+        num
+    }
+
+    fn fix_digits(&mut self) {
+        fix_digits(&mut self.mantissa, self.base);
+    }
+}
+
+impl ShlAssign<usize> for OnlyShift {
+    fn shl_assign(&mut self, rhs: usize) {
+        self.exponent += rhs;
+    }
+}
+
+impl PartialEq<OnlyShift> for BaseN {
+    fn eq(&self, other: &OnlyShift) -> bool {
+        // if self.exponent != 0 || self.mantissa.len() != other.mantissa.len() + other.exponent {
+        //     false
+        // } else {
+        //     // self.exponent == 0 && self.mantissa == other.mantissa
+        //     for i in 0..self.mantissa.len() {
+        //         if (i < other.exponent && self.mantissa[i] != 0) || (i >= other.exponent && self.mantissa[i] != other.mantissa[i-other.exponent]) {
+        //             return false
+        //         }
+        //     }
+        //     true
+        // }
+        self.partial_cmp(other) == Some(Equal)
+    }
+}
+
+impl PartialEq<BaseN> for OnlyShift {
+    fn eq(&self, other: &BaseN) -> bool {
+        other == self
+    }
+}
+
+impl PartialOrd<OnlyShift> for BaseN {
+    fn partial_cmp(&self, other: &OnlyShift) -> Option<Ordering> {
+        debug_assert_eq!(self.base, other.base);
+        // if self == other {
+        //     Some(Equal)
+        // } else {
+
+        match (self.mantissa.len() + self.exponent).cmp(&(other.mantissa.len() + other.exponent)) {
+            Equal => {
+                let ord =
+                    self.mantissa.iter().rev()
+                        .zip_longest(other.mantissa.iter().rev())
+                        .map(|x| (x.clone().left().unwrap_or(&0), x.right().unwrap_or(&0)))
+                        .find_map(|(x, y)| {
+                            match x.cmp(y) {
+                                Equal => None,
+                                ord => Some(ord)
+                            }
+                        });
+
+                match ord {
+                    Some(ord) => Some(ord),
+                    None => Some(Equal)
+                }
+            }
+            ord => Some(ord)
+        }
+    }
+}
+
+impl PartialOrd<BaseN> for OnlyShift {
+    fn partial_cmp(&self, other: &BaseN) -> Option<Ordering> {
+        match other.partial_cmp(self) {
+            Some(Greater) => Some(Less),
+            Some(Less) => Some(Greater),
+            ord => ord
+        }
+    }
+}
+
+
+
+fn fix_digits(mantissa: &mut VecDeque<usize>, base: usize) {
+    let mut i = 0;
+    while i < mantissa.len() {
+        if mantissa[i] >= base {
+            if i == mantissa.len() - 1 {
+                mantissa.push_back(0);
+            }
+            mantissa[i+1] += mantissa[i] / base;
+            mantissa[i] %= base;
+        }
+        i += 1;
+    }
+}
 
 pub(crate) struct Amidakuji {
-    next_fn: fn(&Vec<Integer>) -> (Vec<Integer>, usize)
+    next_fn: fn(&Vec<BaseN>) -> Vec<BaseN>, 
+    base_fn: fn(usize) -> usize
 }
 
 impl Amidakuji {
-    pub(crate) fn new(next_fn: fn(&Vec<Integer>) -> (Vec<Integer>, usize)) -> Self {
-        Self { next_fn }
+    pub(crate) fn new(next_fn: fn(&Vec<BaseN>) -> Vec<BaseN>, base_fn: fn(usize) -> usize) -> Self {
+        Self { 
+            next_fn,
+            base_fn
+        }
     }
 
     pub(crate) fn calculate(&self, vertical_range: impl Iterator<Item=usize> + Clone) -> AmidakujiResult{
-        self.calc(vertical_range, false)
+        self.calc(vertical_range, false, 1)
     }
 
-    pub(crate) fn calculate_parallel(&self, vertical_range: impl Iterator<Item=usize> + Clone) -> AmidakujiResult{
-        self.calc(vertical_range, true)
+    pub(crate) fn calculate_parallel(&self, vertical_range: impl Iterator<Item=usize> + Clone, thread_max: usize) -> AmidakujiResult{
+        self.calc(vertical_range, true, thread_max)
     }
     
-    fn calc(&self, vertical_range: impl Iterator<Item=usize> + Clone, parallel: bool) -> AmidakujiResult {
+    fn calc(&self, vertical_range: impl Iterator<Item=usize> + Clone, parallel: bool, thread_max: usize) -> AmidakujiResult {
         let mut results = Vec::new();
         let total_time = Instant::now();
         let mut handlers = Vec::new();
         let counter = Arc::new(Mutex::new(0));
         let counter_max = vertical_range.clone().count();
         let next_fn = self.next_fn;
+        let base_fn = self.base_fn;
         let finished = Arc::new(Mutex::new(false));
+        let thread_count = Arc::new(Mutex::new(0));
         let timer_handler = {
             let finished = finished.clone();
             let counter = counter.clone();
@@ -46,32 +313,66 @@ impl Amidakuji {
             })
         };
         for vertical in vertical_range {
+            while *thread_count.lock().unwrap() >= thread_max {
+                thread::sleep(Duration::from_millis(100));
+            }
             let counter = counter.clone();
+            *thread_count.lock().unwrap() += 1;
+            let thread_count = thread_count.clone();
             handlers.push(thread::spawn(move || {
                 let time = Instant::now();
-                let mut current = vec![Integer::new(); vertical];
-                current[0] = Integer::from(100 * vertical);
-                let mut total_min = Integer::from(95);
-                let mut total_max = Integer::from(105);
-                let mut count = 0;
-                loop {
-                    let total_change;
-                    (current, total_change) = next_fn(&current);
-                    count += 1;
-                    total_min *= total_change;
-                    total_max *= total_change;
-                    if &total_min <= current.iter().min().unwrap() && current.iter().max().unwrap() <= &total_max {
-                        break;
-                    }
-                }
+                let base = base_fn(vertical);
+                let mut accuracy = 1; // 105f64.log(base as f64).ceil() as usize;
+                let result =
+                    'outer: loop {
+                        let mut current = vec![BaseN::new(base, accuracy, 0); vertical];
+                        current[0] = BaseN::new(base, accuracy, 100 * vertical);
+                        let mut total_min = OnlyShift::new(base, 95);
+                        let mut total_max = OnlyShift::new(base, 105);
+                        let mut count = 0;
+                        loop {
+                            current = next_fn(&current);
+                            count += 1;
+                            total_min <<= 1;
+                            total_max <<= 1;
+                            
+                            #[inline(always)]
+                            fn le_accuracy(lhs: &OnlyShift, rhs: &BaseN) -> Option<bool> {
+                                if lhs <= rhs {
+                                    Some(true)
+                                } else if &rhs.get_error_max() <= lhs {
+                                    Some(false)
+                                } else {
+                                    None
+                                }
+                            }
+                            #[inline(always)]
+                            fn accuracy_le(lhs: &BaseN, rhs: &OnlyShift) -> Option<bool> {
+                                if &lhs.get_error_max() <= rhs {
+                                    Some(true)
+                                } else if rhs < lhs {
+                                    Some(false)
+                                } else {
+                                    None
+                                }
+                            }
 
-                assert_eq!(total_min / 95 * 100 * vertical, current.iter().sum::<Integer>());
+                            match (le_accuracy(&total_min, current.iter().min().unwrap()), accuracy_le(current.iter().max().unwrap(), &total_max)) {
+                                (Some(true), Some(true)) => break 'outer count,
+                                (None, _) | (_, None) => break,
+                                _ => (),
+                            }
+                        }
+                        accuracy *= 2;
+                    };
+                
 
                 let mut counter = counter.lock().unwrap();
                 *counter += 1;
+                *thread_count.lock().unwrap() -= 1;
                 print!("\r[\x1b[32m{}\x1b[36m{}\x1b[0m] {:>02}:{:>02}", "#".repeat(*counter), "-".repeat(counter_max - *counter), total_time.elapsed().as_secs() / 60, total_time.elapsed().as_secs() % 60);
                 stdout().flush().unwrap();
-                (vertical, count, time.elapsed())
+                (vertical, result, time.elapsed())
             }));
             if !parallel {
                 results.push(handlers.into_iter().last().unwrap().join().unwrap());
@@ -112,14 +413,13 @@ impl AmidakujiResult {
 }
 
 
-
 pub(crate) fn construct_normal_amidakuji () -> Amidakuji {
     let normal_amidakuji_next_fn =
-        |current: &Vec<Integer>| {
+        |current: &Vec<BaseN>| {
             let vertical = current.len();
             let mut next = current.clone();
             for i in 0..vertical {
-                next[i] *=
+                next[i] *= 
                     if i == 0 || i == vertical - 1 {
                         vertical - 2
                     } else {
@@ -132,154 +432,54 @@ pub(crate) fn construct_normal_amidakuji () -> Amidakuji {
             for i in 0..vertical-1 {
                 next[i+1] += &current[i];
             }
-            (next, vertical-1)
+            
+            next
         };
-    Amidakuji::new(normal_amidakuji_next_fn)
+    Amidakuji::new(normal_amidakuji_next_fn, |vertical| vertical - 1)
 }
 
 
 pub(crate) fn construct_connected_amidakuji () -> Amidakuji {
     let connected_amidakuji_next_fn =
-        |current: &Vec<Integer>| {
+        |current: &Vec<BaseN>| {
             let vertical = current.len();
             let mut next = current.clone();
             for i in 0..vertical {
                 next[i] *= vertical - 2;
             }
-            // next[1] += &current[0];
-            next[vertical-1] += &current[0];
-            // next[vertical-2] += &current[vertical-1];
-            for i in 1..vertical {
-                next[i-1] += &current[i];
+            for i in 0..vertical { // modified
+                next[(i+vertical-1) % vertical] += &current[i];
             }
-            next[0] += &current[vertical-1];
-            for i in 0..vertical-1 {
-                next[i+1] += &current[i];
+            for i in 0..vertical { // modified
+                next[(i+1) % vertical] += &current[i];
             }
-            // for i in 1..vertical-1 {
-            //     next[i-1] += &current[i];
-            //     next[i+1] += &current[i];
-            // }
-            (next, vertical)
+            
+            next
         };
-    Amidakuji::new(connected_amidakuji_next_fn)
+    Amidakuji::new(connected_amidakuji_next_fn, |vertical| vertical)
 }
-
 
 
 pub(crate) fn construct_connected_amidakuji_with_long_line () -> Amidakuji {
     let connected_amidakuji_with_long_line =
-        |current: &Vec<Integer>| {
+        |current: &Vec<BaseN>| {
             let vertical = current.len();
             let mut next = current.clone();
             for i in 0..vertical {
                 next[i] *= vertical * (vertical - 1) / 2 - vertical + 1;
+                // Sub実装すれば計算量改善できる
+                let mut sum = 
+                    if i == 0 { current[1].clone() }
+                    else      { current[0].clone() };
+                for (j, x) in current.iter().enumerate().skip(if i == 0 { 2 } else { 1 }) {
+                    if i != j {
+                        sum += x;
+                    }
+                }
+                next[i] += &sum;
             }
-            let sum = current.iter().sum::<Integer>();
-            for i in 0..vertical {
-                next[i] += (&sum - &current[i]).complete();
-            }
-            (next, vertical * (vertical - 1) / 2)
+            
+            next
         };
-    Amidakuji::new(connected_amidakuji_with_long_line)
+    Amidakuji::new(connected_amidakuji_with_long_line, |vertical| vertical * (vertical - 1) / 2)
 }
-
-
-
-
-
-// pub(crate) fn normal_amidakuji_2 (vertical_range: impl Iterator<Item = usize> + Clone, accuracy: usize, acc_base: f64) -> AmidakujiResult {
-//     fn replicate<T> (n: usize, f: &impl Fn(Vec<T>) -> Vec<T>, x: Vec<T>) -> Vec<T> {
-//         // println!("{}", n);
-//         // if n == 0 {
-//         //     x
-//         // } else {
-//         //     replicate(n-1, f, f(x))
-//         // }
-//         let mut v = x;
-//         for _ in 0..n {
-//             v = f(v);
-//         }
-//         v
-//     }
-//     fn next (current: Vec<Integer>) -> Vec<Integer> {
-//         // println!("{}", size_of_val(&current));
-//         // println!("next started");
-//         let r =
-//         (0..current.len()).map(|i| {
-//             let x = current[i].clone() * (current.len() - 2);
-//             if i == 0 {
-//                                        x + current[i+1].clone()
-//             } else if i == current.len() - 1 {
-//                 current[i-1].clone() + x
-//             } else {
-//                 current[i-1].clone() + x + current[i+1].clone()
-//             }
-//         }).collect_vec();
-//         // println!("next finished");
-//         r
-//     }
-//     let time = Instant::now();
-//     let range_length = vertical_range.clone().count();
-//     let digits = range_length.to_string().len();
-//     print!("{} / {} [{}] 00:00:00", "0".repeat(digits), range_length, "-".repeat(accuracy));
-//     stdout().flush().unwrap();
-//     let finished = Arc::new(Mutex::new(false));
-//     let handler =
-//         {
-//             let finished = finished.clone();
-//             thread::spawn(move || {
-//                 while !(*finished.lock().unwrap()) {
-//                     thread::sleep(Duration::from_secs(1));
-//                     let elapsed = time.elapsed().as_secs();
-//                     print!("\x1b[8D{:>02}:{:>02}:{:>02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60);
-//                     stdout().flush().unwrap();
-//                 }
-//             })
-//         };
-//     let result =
-//         vertical_range.enumerate().map(|(nth, vertical)| {
-//             let mut needed_horizontal = 0;
-// 
-//             let mut last_index = 0.;
-//             let mut index = 1.;
-//             for i in 0..accuracy {
-//                 let horizontal = acc_base.powf(index).floor() as u64;
-// 
-//                 // let mut handlers = vec![];
-//                 // for _ in 0..thread_count {
-//                 //     handlers.push(f(vertical, horizontal));
-//                 // }
-// 
-//                 // let goals = handlers.into_iter().fold(vec![0; vertical], |prev, x| {
-//                 //     x.join().unwrap().iter().zip(prev).map(|(a, b)| a + b).collect()
-//                 // });
-//                 
-//                 let start = (0..vertical).map(|v| Integer::from(if v == 0 { 1 } else { 0 })).collect_vec();
-//                 let goals = replicate(horizontal as usize, &next, start);
-//                 
-// 
-//                 if check_fair_integer(&goals, vertical, &goals.iter().sum()) {
-//                     needed_horizontal = horizontal;
-//                     index = (last_index + index) / 2.;
-//                 } else if index % 1. == 0. {
-//                     (index, last_index) = (index + 1., index);
-//                 } else {
-//                     (index, last_index) = (index + (index - last_index) / 2., index);
-//                 }
-//                 // println!("check fair");
-//                 print!("\r{:>0digits$} / {} [\x1b[32m{}\x1b[36m{}\x1b[0m]\x1b[9C", nth+1, range_length, "#".repeat(i + 1), "-".repeat(accuracy - i - 1), digits = digits);
-//                 stdout().flush().unwrap();
-//             }
-//             (vertical, needed_horizontal)
-//         }).collect();
-//     *finished.lock().unwrap() = true;
-//     handler.join().unwrap();
-//     let result = AmidakujiResult {
-//         result,
-//         elapsed: time.elapsed()
-//     };
-//     println!("\r\x1b[2K{0} / {0} [\x1b[32mFinished\x1b[0m] {1}", range_length, result.fmt_elapsed());
-//     result
-// }
-
