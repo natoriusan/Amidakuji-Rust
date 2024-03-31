@@ -1,303 +1,357 @@
 #![allow(dead_code)]
 
-use std::cmp::Ordering;
-use std::cmp::Ordering::{Equal, Greater, Less};
-use std::collections::VecDeque;
+use std::cmp::{max_by, min_by, Ordering};
+use std::cmp::Ordering::Equal;
+use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{stdout, Write};
-use std::ops::{AddAssign, MulAssign, ShlAssign};
+use std::mem::swap;
+use std::ops::{Add, Mul};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
 use itertools::Itertools;
+use rug::Float;
+use rug::float::Round;
+use rug::ops::{AddAssignRound, MulAssignRound};
 
-
-#[derive(Clone, Debug)] 
-pub(crate) struct BaseN {
-    mantissa: VecDeque<usize>,
-    exponent: usize,
-    base: usize,
-    accuracy: usize,
-    max_error: usize
+#[derive(Clone, Debug)]
+struct FloatWithExponent {
+    value: Float,
+    exponent: i64
 }
 
-impl BaseN {
-    fn new(base: usize, accuracy: usize, value: usize) -> Self {
-        let mut num =
-            Self {
-                mantissa: VecDeque::from([value]),
-                exponent: 0,
-                base,
-                accuracy,
-                max_error: 0
-            };
-        num.fix_digits();
-        num.round_down();
-        num
-    }
-
-    fn adjust_exponent(&mut self, exponent: usize) {
-        for _ in 0..self.exponent.saturating_sub(exponent) {
-            self.mantissa.push_front(0);
-        }
-        self.exponent = self.exponent.min(exponent);
-    }
-
-    fn fix_digits(&mut self) {
-        fix_digits(&mut self.mantissa, self.base);
-        // let mut i = 0;
-        // while i < self.mantissa.len() {
-        //     if self.mantissa[i] >= self.base {
-        //         if i == self.mantissa.len() - 1 {
-        //             self.mantissa.push_back(0);
-        //         }
-        //         self.mantissa[i+1] += self.mantissa[i] / self.base;
-        //         self.mantissa[i] %= self.base;
-        //     }
-        //     i += 1;
-        // }
-    }
-
-    fn round_down(&mut self) {
-        self.exponent += self.mantissa.len().saturating_sub(self.accuracy);
-        for _ in 0..self.mantissa.len().saturating_sub(self.accuracy) {
-            self.mantissa.pop_front();
+impl FloatWithExponent {
+    fn new(mut value: Float) -> Self {
+        let exponent = value.get_exp().unwrap_or(0);
+        value >>= exponent;
+        let exponent = exponent as i64;
+        Self {
+            value,
+            exponent
         }
     }
-    
-    fn get_error_max(&self) -> Self {
-        let mut num = self.clone();
-        while num.mantissa.len() < self.max_error + 1 {
-            num.mantissa.push_back(0);
+
+    fn add_assign_round(&mut self, rhs: &FloatWithExponent, round: Round) {
+        debug_assert_eq!(self.value.prec(), rhs.value.prec());
+        if self.value.is_zero() {
+            *self = rhs.clone();
+        } else if !rhs.value.is_zero() {
+            let shifted_rhs = rhs.value.clone() >> (self.exponent - rhs.exponent).clamp(-(self.value.prec() as i64), self.value.prec() as i64) as i32;
+            self.value.add_assign_round(shifted_rhs, round);
         }
-        num.mantissa[self.max_error] += 1;
-        num.fix_digits();
-        num
+    }
+
+    fn mul_round(mut self, rhs: &FloatWithExponent, round: Round) -> Self {
+        self.mul_assign_round(rhs, round);
+        self
+    }
+
+    fn mul_assign_round(&mut self, rhs: &FloatWithExponent, round: Round) {
+        self.value.mul_assign_round(&rhs.value, round);
+        self.exponent += rhs.exponent;
     }
 }
 
-impl ShlAssign<usize> for BaseN {
-    fn shl_assign(&mut self, rhs: usize) {
-        self.exponent += rhs;
-    }
-}
-
-impl AddAssign<&BaseN> for BaseN {
-    fn add_assign(&mut self, rhs: &BaseN) {
-        debug_assert_eq!(self.base, rhs.base);
-        debug_assert_eq!(self.accuracy, rhs.accuracy);
-        let lhs_length = self.mantissa.len();
-        let lhs_exponent = self.exponent;
-        self.adjust_exponent(rhs.exponent);
-        for (i, x) in rhs.mantissa.iter().enumerate() {
-            while i + (rhs.exponent - self.exponent) >= self.mantissa.len() {
-                self.mantissa.push_back(0);
-            }
-            self.mantissa[i + (rhs.exponent - self.exponent)] += x;
-        }
-        self.fix_digits();
-        self.max_error = self.max_error.max(rhs.max_error);
-        if !(self.mantissa.len() <= self.accuracy && (self.exponent == 0 || rhs.exponent == 0)) {
-            self.max_error = self.max_error.max(
-                (self.mantissa.len() + self.exponent).abs_diff(
-                    rhs.mantissa.len() + rhs.exponent
-                )
-            );
-            self.max_error = self.max_error.max(
-                (self.mantissa.len() + self.exponent).abs_diff(
-                    lhs_length + lhs_exponent
-                )
-            );
-        }
-        self.round_down()
-    }
-}
-
-impl MulAssign<usize> for BaseN {
-    fn mul_assign(&mut self, rhs: usize) {
-        self.mantissa.iter_mut().for_each(|x| *x *= rhs);
-        self.fix_digits();
-    }
-}
-
-impl PartialEq for BaseN {
+impl PartialEq for FloatWithExponent {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Equal
-    }
-}
-
-impl Eq for BaseN {
-
-}
-
-impl PartialOrd for BaseN {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for BaseN {
-    fn cmp(&self, other: &Self) -> Ordering {
-        debug_assert_eq!(self.base, other.base);
-        debug_assert_eq!(self.accuracy, other.accuracy);
-
-        match (self.mantissa.len() + self.exponent).cmp(&(other.mantissa.len() + other.exponent)) {
-            Equal => {
-                self.mantissa.iter().rev()
-                    .zip_longest(other.mantissa.iter().rev())
-                    .map(|x| (x.clone().left().unwrap_or(&0), x.right().unwrap_or(&0)))
-                    .find_map(|(x, y)| {
-                        match x.cmp(y) {
-                            Equal => None,
-                            ord => Some(ord)
-                        }
-                    })
-                    .unwrap_or(Equal)
-            }
-            ord => ord
-        }
-    }
-}
-
-
-#[derive(Debug)]
-struct OnlyShift {
-    mantissa: VecDeque<usize>,
-    exponent: usize,
-    base: usize
-}
-
-impl OnlyShift {
-    fn new(base: usize, value: usize) -> Self {
-        let mut num =
-            Self {
-                mantissa: VecDeque::from([value]),
-                exponent: 0,
-                base
-            };
-        num.fix_digits();
-        num
-    }
-
-    fn fix_digits(&mut self) {
-        fix_digits(&mut self.mantissa, self.base);
-    }
-}
-
-impl ShlAssign<usize> for OnlyShift {
-    fn shl_assign(&mut self, rhs: usize) {
-        self.exponent += rhs;
-    }
-}
-
-impl PartialEq<OnlyShift> for BaseN {
-    fn eq(&self, other: &OnlyShift) -> bool {
-        // if self.exponent != 0 || self.mantissa.len() != other.mantissa.len() + other.exponent {
-        //     false
-        // } else {
-        //     // self.exponent == 0 && self.mantissa == other.mantissa
-        //     for i in 0..self.mantissa.len() {
-        //         if (i < other.exponent && self.mantissa[i] != 0) || (i >= other.exponent && self.mantissa[i] != other.mantissa[i-other.exponent]) {
-        //             return false
-        //         }
-        //     }
-        //     true
-        // }
         self.partial_cmp(other) == Some(Equal)
     }
 }
 
-impl PartialEq<BaseN> for OnlyShift {
-    fn eq(&self, other: &BaseN) -> bool {
-        other == self
+impl PartialOrd for FloatWithExponent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.value.is_zero() || other.value.is_zero() || self.exponent == other.exponent {
+            self.value.partial_cmp(&other.value)
+        } else {
+            self.exponent.partial_cmp(&other.exponent)
+        }
     }
 }
 
-impl PartialOrd<OnlyShift> for BaseN {
-    fn partial_cmp(&self, other: &OnlyShift) -> Option<Ordering> {
-        debug_assert_eq!(self.base, other.base);
-        // if self == other {
-        //     Some(Equal)
-        // } else {
 
-        match (self.mantissa.len() + self.exponent).cmp(&(other.mantissa.len() + other.exponent)) {
-            Equal => {
-                let ord =
-                    self.mantissa.iter().rev()
-                        .zip_longest(other.mantissa.iter().rev())
-                        .map(|x| (x.clone().left().unwrap_or(&0), x.right().unwrap_or(&0)))
-                        .find_map(|(x, y)| {
-                            match x.cmp(y) {
-                                Equal => None,
-                                ord => Some(ord)
-                            }
-                        });
+fn checked_float(f: MinMaxBound) -> Option<MinMaxBound> {
+    if f.value_min.value.is_infinite() || f.value_min.value.is_nan() || f.value_max.value.is_infinite() || f.value_max.value.is_nan() {
+        None
+    } else {
+        Some(f)
+    }
+}
 
-                match ord {
-                    Some(ord) => Some(ord),
-                    None => Some(Equal)
-                }
+fn check_float(f: &MinMaxBound) -> Option<()> {
+    if f.value_min.value.is_infinite() || f.value_min.value.is_nan() || f.value_max.value.is_infinite() || f.value_max.value.is_nan() {
+        None
+    } else {
+        Some(())
+    }
+}
+
+
+#[derive(Clone, Debug)]
+struct MinMaxBound {
+    value_min: FloatWithExponent,
+    value_max: FloatWithExponent,
+}
+
+impl MinMaxBound {
+    fn new(value_min: Float, value_max: Float) -> Option<Self> {
+        checked_float(
+            Self {
+                value_min: FloatWithExponent::new(value_min),
+                value_max: FloatWithExponent::new(value_max)
             }
-            ord => Some(ord)
+        )
+    }
+
+    fn identity(precision: u32) -> Option<Self> {
+        Self::from_u32(1, precision)
+    }
+
+    fn from_u32(value: u32, precision: u32) -> Option<Self> {
+        Self::new(
+            Float::with_val_round(precision, value, Round::Down).0,
+            Float::with_val_round(precision, value, Round::Up).0
+        )
+    }
+
+    fn sin(k: u32, u: u32, precision: u32) -> Option<Self> {
+        // checks if precision is enough to express whole bits of integer
+        if k == 0 || precision > k.ilog2() {
+            let mut min_f = Float::with_val(precision, k);
+            let mut max_f = Float::with_val(precision, k);
+            min_f.sin_u_round(u, Round::Down);
+            max_f.sin_u_round(u, Round::Up);
+            Self::new(min_f, max_f)
+        } else {
+            None
         }
     }
-}
 
-impl PartialOrd<BaseN> for OnlyShift {
-    fn partial_cmp(&self, other: &BaseN) -> Option<Ordering> {
-        match other.partial_cmp(self) {
-            Some(Greater) => Some(Less),
-            Some(Less) => Some(Greater),
-            ord => ord
+    fn cos(k: u32, u: u32, precision: u32) -> Option<Self> {
+        // check precision to express whole bits of integer
+        if k == 0 || precision > k.ilog2() {
+            let mut min_f = Float::with_val(precision, k);
+            let mut max_f = Float::with_val(precision, k);
+            min_f.cos_u_round(u, Round::Down);
+            max_f.cos_u_round(u, Round::Up);
+            Self::new(min_f, max_f)
+        } else {
+            None
         }
     }
-}
 
-
-
-fn fix_digits(mantissa: &mut VecDeque<usize>, base: usize) {
-    let mut i = 0;
-    while i < mantissa.len() {
-        if mantissa[i] >= base {
-            if i == mantissa.len() - 1 {
-                mantissa.push_back(0);
+    fn recip(x: u32, precision: u32) -> Option<Self> {
+        Self::new(
+            {
+                let mut f = Float::with_val_round(precision, x, Round::Up).0;
+                f.recip_round(Round::Down);
+                f
+            },
+            {
+                let mut f = Float::with_val_round(precision, x, Round::Down).0;
+                f.recip_round(Round::Up);
+                f
             }
-            mantissa[i+1] += mantissa[i] / base;
-            mantissa[i] %= base;
+        )
+    }
+
+    fn fix_exponent(&mut self) {
+        self.value_min.exponent += self.value_min.value.get_exp().unwrap_or(0) as i64;
+        self.value_min.value >>= self.value_min.value.get_exp().unwrap_or(0);
+        self.value_max.exponent += self.value_max.value.get_exp().unwrap_or(0) as i64;
+        self.value_max.value >>= self.value_max.value.get_exp().unwrap_or(0);
+    }
+
+    fn add_assign(&mut self, rhs: &MinMaxBound) -> Option<()> {
+        self.value_min.add_assign_round(&rhs.value_min, Round::Down);
+        self.value_max.add_assign_round(&rhs.value_max, Round::Up);
+        
+        check_float(self)?;
+        self.fix_exponent();
+        Some(())
+    }
+
+    fn mul_assign(&mut self, rhs: &MinMaxBound) -> Option<()> {
+        match ((self.value_max.value.is_sign_positive(), rhs.value_max.value.is_sign_positive()), (self.value_min.value.is_sign_positive(), rhs.value_min.value.is_sign_positive())) {
+            ((true, true), (true, true)) => {
+                self.value_max.mul_assign_round(&rhs.value_max, Round::Up);
+                self.value_min.mul_assign_round(&rhs.value_min, Round::Down);
+            },
+            ((true, true), (true, false)) => {
+                // 順番変えちゃだめ
+                self.value_min = self.value_max.clone().mul_round(&rhs.value_min, Round::Down);
+                self.value_max.mul_assign_round(&rhs.value_max, Round::Up);
+            },
+            ((true, true), (false, true)) => {
+                self.value_max.mul_assign_round(&rhs.value_max, Round::Up);
+                self.value_min.mul_assign_round(&rhs.value_max, Round::Down);
+            },
+            ((true, true), (false, false)) => {
+                self.value_max = max_by(
+                    self.value_max.clone().mul_round(&rhs.value_max, Round::Up),
+                    self.value_min.clone().mul_round(&rhs.value_min, Round::Up),
+                    |x, y| x.partial_cmp(y).unwrap()
+                );
+                self.value_min = min_by(
+                    self.value_max.clone().mul_round(&rhs.value_min, Round::Down),
+                    self.value_min.clone().mul_round(&rhs.value_max, Round::Down),
+                    |x, y| x.partial_cmp(y).unwrap()
+                )
+            },
+            ((true, false), (true, false)) => {
+                self.value_max.mul_assign_round(&rhs.value_min, Round::Down);
+                self.value_min.mul_assign_round(&rhs.value_max, Round::Up);
+                swap(&mut self.value_max, &mut self.value_min);
+            },
+            ((true, false), (false, false)) => {
+                self.value_max.mul_assign_round(&rhs.value_min, Round::Down);
+                self.value_min.mul_assign_round(&rhs.value_max, Round::Up);
+                swap(&mut self.value_max, &mut self.value_min);
+            },
+            ((false, true), (false, true)) => {
+                self.value_max.mul_assign_round(&rhs.value_min, Round::Up);
+                self.value_min.mul_assign_round(&rhs.value_max, Round::Down);
+            },
+            ((false, true), (false, false)) => {
+                // 順番変えちゃだめ
+                self.value_max = self.value_min.clone().mul_round(&rhs.value_min, Round::Up);
+                self.value_min.mul_assign_round(&rhs.value_max, Round::Down);
+            },
+            ((false, false), (false, false)) => {
+                self.value_max.mul_assign_round(&rhs.value_max, Round::Down);
+                self.value_min.mul_assign_round(&rhs.value_min, Round::Up);
+                swap(&mut self.value_max, &mut self.value_min);
+            },
+            ((false, _), (true, _)) | ((_, false), (_, true)) => unreachable!()
         }
-        i += 1;
+
+
+        check_float(self)?;
+        self.fix_exponent();
+        
+        
+        Some(())
     }
 }
+
+impl Add<&MinMaxBound> for MinMaxBound {
+    type Output = Option<Self>;
+
+    fn add(mut self, rhs: &MinMaxBound) -> Self::Output {
+        self.add_assign(rhs)?;
+        Some(self)
+    }
+}
+
+impl Mul<&MinMaxBound> for MinMaxBound {
+    type Output = Option<Self>;
+
+    fn mul(mut self, rhs: &Self) -> Self::Output {
+        self.mul_assign(rhs)?;
+        Some(self)
+    }
+}
+
+impl Display for MinMaxBound {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{} * 2^{}, {} * 2^{}]", self.value_min.value.clone(), self.value_min.exponent, self.value_max.value.clone(), self.value_max.exponent)
+    }
+}
+
+
+#[derive(Clone, Debug)]
+struct Vector {
+    components: Vec<MinMaxBound>
+}
+
+
+impl Vector {
+    fn new(components: impl Into<Vec<MinMaxBound>>) -> Self {
+        Self {
+            components: components.into()
+        }
+    }
+
+    fn identity(m: u32, precision: u32) -> Option<Self> {
+        Some(
+            Self::new(vec![MinMaxBound::identity(precision)?; m as usize])
+        )
+    }
+
+    fn inner_product(self, rhs: &Vector) -> Option<MinMaxBound> {
+        let mut r = (self.components[0].clone() * &rhs.components[0])?;
+        check_float(&r)?;
+        for (x, y) in self.components.into_iter().zip_eq(&rhs.components).skip(1) {
+            r.add_assign(&(x * y)?)?;
+        }
+
+        Some(r)
+    }
+
+    fn mul_assign(&mut self, rhs: &Vector) -> Option<()> {
+        for (x, y) in self.components.iter_mut().zip_eq(&rhs.components) {
+            x.mul_assign(y)?;
+        }
+        Some(())
+    }
+}
+
+impl Mul<&Vector> for Vector {
+    type Output = Option<Self>;
+
+    fn mul(mut self, rhs: &Self) -> Self::Output {
+        self.mul_assign(rhs)?;
+        Some(self)
+    }
+}
+
+
 
 pub(crate) struct Amidakuji {
-    next_fn: fn(&Vec<BaseN>) -> Vec<BaseN>, 
-    base_fn: fn(usize) -> usize
+    // m, precision
+    diag_fn: fn(u32, u32) -> Option<Vector>,
+    // m, from, to, precision
+    pre_suf_fn: fn(u32, u32, u32, u32) -> Option<Vector>,
+    // m, precision
+    total_ratio_fn: fn(u32, u32) -> Option<MinMaxBound>,
+    // m -> (from, to)
+    least_fn: fn(u32) -> (u32, u32),
+    // m -> (from, to)
+    most_fn: fn(u32) -> (u32, u32)
 }
 
 impl Amidakuji {
-    pub(crate) fn new(next_fn: fn(&Vec<BaseN>) -> Vec<BaseN>, base_fn: fn(usize) -> usize) -> Self {
-        Self { 
-            next_fn,
-            base_fn
+    fn new(diag_fn: fn(u32, u32) -> Option<Vector>, pre_suf_fn: fn(u32, u32, u32, u32) -> Option<Vector>, total_ratio_fn: fn(u32, u32) -> Option<MinMaxBound>, least_fn: fn(u32) -> (u32, u32), most_fn: fn(u32) -> (u32, u32)) -> Self {
+        Self {
+            diag_fn,
+            pre_suf_fn,
+            total_ratio_fn,
+            least_fn,
+            most_fn
         }
     }
 
-    pub(crate) fn calculate(&self, vertical_range: impl Iterator<Item=usize> + Clone) -> AmidakujiResult{
-        self.calc(vertical_range, false, 1)
+    pub(crate) fn calculate(&self, vertical_range: impl Iterator<Item=u32> + Clone, max_statusbar_width: Option<u32>) -> AmidakujiResult {
+        self.calc(vertical_range, false, 1, max_statusbar_width)
     }
 
-    pub(crate) fn calculate_parallel(&self, vertical_range: impl Iterator<Item=usize> + Clone, thread_max: usize) -> AmidakujiResult{
-        self.calc(vertical_range, true, thread_max)
+    pub(crate) fn calculate_parallel(&self, vertical_range: impl Iterator<Item=u32> + Clone, thread_max: usize, max_statusbar_width: Option<u32>) -> AmidakujiResult {
+        self.calc(vertical_range, true, thread_max, max_statusbar_width)
     }
     
-    fn calc(&self, vertical_range: impl Iterator<Item=usize> + Clone, parallel: bool, thread_max: usize) -> AmidakujiResult {
+    fn calc(&self, vertical_range: impl Iterator<Item=u32> + Clone, parallel: bool, thread_max: usize, max_statusbar_width: Option<u32>) -> AmidakujiResult {
         let mut results = Vec::new();
         let total_time = Instant::now();
         let mut handlers = Vec::new();
         let counter = Arc::new(Mutex::new(0));
-        let counter_max = vertical_range.clone().count();
-        let next_fn = self.next_fn;
-        let base_fn = self.base_fn;
+        let vertical_count = vertical_range.clone().count();
+        let max_statusbar_width = max_statusbar_width.map(|x| (x as usize).min(vertical_count)).unwrap_or(vertical_count);
+        let diag_fn = self.diag_fn;
+        let pre_suf_fn = self.pre_suf_fn;
+        let total_ratio_fn = self.total_ratio_fn;
+        let least_fn = self.least_fn;
+        let most_fn = self.most_fn;
         let finished = Arc::new(Mutex::new(false));
         let thread_count = Arc::new(Mutex::new(0));
         let timer_handler = {
@@ -305,9 +359,9 @@ impl Amidakuji {
             let counter = counter.clone();
             thread::spawn(move || {
                 while !(*finished.lock().unwrap()) {
-                    thread::sleep(Duration::from_secs(1));
+                    thread::sleep(Duration::from_millis(100));
                     let counter = counter.lock().unwrap();
-                    print!("\r[\x1b[32m{}\x1b[36m{}\x1b[0m] {:>02}:{:>02}", "#".repeat(*counter), "-".repeat(counter_max - *counter), total_time.elapsed().as_secs() / 60, total_time.elapsed().as_secs() % 60);
+                    print!("\r[\x1b[32m{}\x1b[36m{}\x1b[0m] {:>02}:{:>02}", "#".repeat(*counter * max_statusbar_width / vertical_count), "-".repeat(max_statusbar_width - *counter * max_statusbar_width / vertical_count), total_time.elapsed().as_secs() / 60, total_time.elapsed().as_secs() % 60);
                     stdout().flush().unwrap();
                 }
             })
@@ -321,56 +375,76 @@ impl Amidakuji {
             let thread_count = thread_count.clone();
             handlers.push(thread::spawn(move || {
                 let time = Instant::now();
-                let base = base_fn(vertical);
-                let mut accuracy = 1; // 105f64.log(base as f64).ceil() as usize;
-                let result =
-                    'outer: loop {
-                        let mut current = vec![BaseN::new(base, accuracy, 0); vertical];
-                        current[0] = BaseN::new(base, accuracy, 100 * vertical);
-                        let mut total_min = OnlyShift::new(base, 95);
-                        let mut total_max = OnlyShift::new(base, 105);
-                        let mut count = 0;
-                        loop {
-                            current = next_fn(&current);
-                            count += 1;
-                            total_min <<= 1;
-                            total_max <<= 1;
-                            
-                            #[inline(always)]
-                            fn le_accuracy(lhs: &OnlyShift, rhs: &BaseN) -> Option<bool> {
-                                if lhs <= rhs {
-                                    Some(true)
-                                } else if &rhs.get_error_max() <= lhs {
-                                    Some(false)
-                                } else {
-                                    None
-                                }
-                            }
-                            #[inline(always)]
-                            fn accuracy_le(lhs: &BaseN, rhs: &OnlyShift) -> Option<bool> {
-                                if &lhs.get_error_max() <= rhs {
-                                    Some(true)
-                                } else if rhs < lhs {
-                                    Some(false)
-                                } else {
-                                    None
-                                }
-                            }
-
-                            match (le_accuracy(&total_min, current.iter().min().unwrap()), accuracy_le(current.iter().max().unwrap(), &total_max)) {
-                                (Some(true), Some(true)) => break 'outer count,
-                                (None, _) | (_, None) => break,
-                                _ => (),
-                            }
-                        }
-                        accuracy *= 2;
-                    };
                 
+                let result =
+                    (0..)
+                        .map(|i| 2_u32.pow(i))
+                        .find_map(|precision| {
+                            let pre_suf_least = pre_suf_fn(vertical, least_fn(vertical).0, least_fn(vertical).1, precision)?;
+                            let pre_suf_most = pre_suf_fn(vertical, most_fn(vertical).0, most_fn(vertical).1, precision)?;
+                            let diag = diag_fn(vertical, precision)?;
+                            let total_ratio = total_ratio_fn(vertical, precision)?; // MinMaxBound::from_u32(m, precision)?; // MinMaxBound::new(Float::with_val_round(precision, m, Round::Down).0);
+                            let low_bound = MinMaxBound::from_u32(95, precision)?;
+                            let high_bound = MinMaxBound::from_u32(105, precision)?;
+                            let mid_mul = MinMaxBound::from_u32(100 * vertical, precision)?;
+                            
+                            let check_fairness = |most: MinMaxBound, least: MinMaxBound, total: &MinMaxBound| -> Option<bool> {
+                                fold(definitely_le((most * &mid_mul)?, (total.clone() * &high_bound)?), definitely_le((total.clone() * &low_bound)?, (least * &mid_mul)?))
+                            };
 
+                            let (diag_powers, total_powers) = {
+                                let mut diag_powers = vec![diag];
+                                let mut total_powers = vec![total_ratio];
+
+                                for index in 0.. {
+                                    if index >= 1 {
+                                        diag_powers.push((diag_powers[index-1].clone() * &diag_powers[index-1])?);
+                                        total_powers.push((total_powers[index-1].clone() * &total_powers[index-1])?);
+                                    }
+
+                                    let most = diag_powers[index].clone().inner_product(&pre_suf_most)?;
+                                    let least = diag_powers[index].clone().inner_product(&pre_suf_least)?;
+                                    let total = &total_powers[index];
+                                    let is_fair = check_fairness(most, least, total)?;
+                                    if is_fair {
+                                        break
+                                    }
+                                }
+
+                                (diag_powers, total_powers)
+                            };
+                            
+                            
+                            let max_index = diag_powers.len() - 1;
+                            {
+                                let mut n = 0;
+                                let mut last_diag = Vector::identity(vertical, precision)?;
+                                let mut last_total = MinMaxBound::identity(precision)?;
+                                for index in (0..max_index).rev() {
+                                    let next_diag = (last_diag.clone() * &diag_powers[index])?;
+                                    let next_total = (last_total.clone() * &total_powers[index])?;
+
+                                    let most = next_diag.clone().inner_product(&pre_suf_most)?;
+                                    let least = next_diag.clone().inner_product(&pre_suf_least)?;
+                                    let total = &next_total;
+                                    
+                                    let is_fair = check_fairness(most, least, total)?;
+
+                                    if !is_fair {
+                                        n |= 2_u64.pow(index as u32);
+                                        last_diag = next_diag;
+                                        last_total = next_total;
+                                    }
+                                }
+
+                                Some(n + 1)
+                            }
+                        }).unwrap();
+                
                 let mut counter = counter.lock().unwrap();
                 *counter += 1;
                 *thread_count.lock().unwrap() -= 1;
-                print!("\r[\x1b[32m{}\x1b[36m{}\x1b[0m] {:>02}:{:>02}", "#".repeat(*counter), "-".repeat(counter_max - *counter), total_time.elapsed().as_secs() / 60, total_time.elapsed().as_secs() % 60);
+                print!("\r[\x1b[32m{}\x1b[36m{}\x1b[0m] {:>02}:{:>02}", "#".repeat(*counter * max_statusbar_width / vertical_count), "-".repeat(max_statusbar_width - *counter * max_statusbar_width / vertical_count), total_time.elapsed().as_secs() / 60, total_time.elapsed().as_secs() % 60);
                 stdout().flush().unwrap();
                 (vertical, result, time.elapsed())
             }));
@@ -389,7 +463,7 @@ impl Amidakuji {
         *finished.lock().unwrap() = true;
         timer_handler.join().unwrap();
 
-        println!("\r[\x1b[32m{}\x1b[0m] {}s", "#".repeat(counter_max), total_time.elapsed().as_secs_f64());
+        println!("\r[\x1b[32m{}\x1b[0m] {}s", "#".repeat(max_statusbar_width), total_time.elapsed().as_secs_f64());
 
         AmidakujiResult {
             results,
@@ -398,8 +472,22 @@ impl Amidakuji {
     }
 }
 
+fn definitely_le(lhs: MinMaxBound, rhs: MinMaxBound) -> Option<bool> {
+    if lhs.value_max <= rhs.value_min {
+        Some(true)
+    } else if rhs.value_max <= lhs.value_min {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn fold(x: Option<bool>, y: Option<bool>) -> Option<bool> {
+    Some(x? && y?)
+}
+
 pub(crate) struct  AmidakujiResult {
-    results: Vec<(usize, u32, Duration)>,
+    results: Vec<(u32, u64, Duration)>,
     total_time: Duration
 }
 
@@ -413,73 +501,96 @@ impl AmidakujiResult {
 }
 
 
+
+fn circulant_pre_suf_fn(vertical: u32, from: u32, to: u32, precision: u32) -> Option<Vector> {
+    Some(
+        Vector::new(
+            (0..vertical).map(|i| {
+                let re1 = MinMaxBound::cos(to * i, vertical, precision)?;
+                let re2 = MinMaxBound::cos(from * i, vertical, precision)?;
+
+                let im1 = MinMaxBound::sin(to * i, vertical, precision)?;
+                let im2 = MinMaxBound::sin(from * i, vertical, precision)?;
+
+                let s = MinMaxBound::recip(vertical, precision)?;
+
+                ((re1 * &re2)? + &(im1 * &im2)?)? * &s
+            }).collect::<Option<Vec<_>>>()?
+        )
+    )
+}
+
+
 pub(crate) fn construct_normal_amidakuji () -> Amidakuji {
-    let normal_amidakuji_next_fn =
-        |current: &Vec<BaseN>| {
-            let vertical = current.len();
-            let mut next = current.clone();
-            for i in 0..vertical {
-                next[i] *= 
-                    if i == 0 || i == vertical - 1 {
-                        vertical - 2
-                    } else {
-                        vertical - 3
-                    };
-            }
-            for i in 1..vertical {
-                next[i-1] += &current[i];
-            }
-            for i in 0..vertical-1 {
-                next[i+1] += &current[i];
-            }
-            
-            next
-        };
-    Amidakuji::new(normal_amidakuji_next_fn, |vertical| vertical - 1)
+    todo!()
 }
 
 
 pub(crate) fn construct_connected_amidakuji () -> Amidakuji {
-    let connected_amidakuji_next_fn =
-        |current: &Vec<BaseN>| {
-            let vertical = current.len();
-            let mut next = current.clone();
-            for i in 0..vertical {
-                next[i] *= vertical - 2;
-            }
-            for i in 0..vertical { // modified
-                next[(i+vertical-1) % vertical] += &current[i];
-            }
-            for i in 0..vertical { // modified
-                next[(i+1) % vertical] += &current[i];
-            }
-            
-            next
+    let diag_fn =
+        |vertical, precision| {
+            Some(
+                Vector::new(
+                    (0..vertical).map(|i| {
+                        let f = MinMaxBound::cos(i, vertical, precision)?;
+                        let mul = MinMaxBound::from_u32(2, precision)?;
+                        let add = MinMaxBound::from_u32(vertical - 2, precision)?; // ::new(Float::with_val_round(precision, m - 2, Round::Down).0);
+
+                        (f * &mul)? + &add
+                    }).collect::<Option<Vec<_>>>()?
+                )
+            )
         };
-    Amidakuji::new(connected_amidakuji_next_fn, |vertical| vertical)
+    
+    let total_ratio_fn =
+        |vertical, precision| {
+            MinMaxBound::from_u32(vertical, precision)
+        };
+    
+    let least_fn =
+        |vertical| {
+            (0, vertical / 2)
+        };
+    
+    let most_fn = 
+        |_| {
+            (0, 0)
+        };
+    
+    Amidakuji::new(diag_fn, circulant_pre_suf_fn, total_ratio_fn, least_fn, most_fn)
 }
 
-
+// 左右接続・飛ばすあみだくじについては、必要な横線の式がわかっているため、より高速に計算できる。
 pub(crate) fn construct_connected_amidakuji_with_long_line () -> Amidakuji {
-    let connected_amidakuji_with_long_line =
-        |current: &Vec<BaseN>| {
-            let vertical = current.len();
-            let mut next = current.clone();
-            for i in 0..vertical {
-                next[i] *= vertical * (vertical - 1) / 2 - vertical + 1;
-                // Sub実装すれば計算量改善できる
-                let mut sum = 
-                    if i == 0 { current[1].clone() }
-                    else      { current[0].clone() };
-                for (j, x) in current.iter().enumerate().skip(if i == 0 { 2 } else { 1 }) {
-                    if i != j {
-                        sum += x;
-                    }
-                }
-                next[i] += &sum;
-            }
-            
-            next
+    let diag_fn =
+        |vertical, precision| {
+            Some(
+                Vector::new(
+                    (0..vertical).map(|i| {
+                        if i == 0 {
+                            MinMaxBound::from_u32(vertical * (vertical - 1) / 2, precision)
+                        } else {
+                            MinMaxBound::from_u32(vertical * (vertical - 1) / 2 - vertical, precision)
+                        }
+                    }).collect::<Option<Vec<_>>>()?
+                )
+            )
         };
-    Amidakuji::new(connected_amidakuji_with_long_line, |vertical| vertical * (vertical - 1) / 2)
+
+    let total_ratio_fn =
+        |vertical, precision| {
+            MinMaxBound::from_u32(vertical * (vertical - 1) / 2, precision)
+        };
+
+    let least_fn =
+        |_| {
+            (0, 1)
+        };
+
+    let most_fn =
+        |_| {
+            (0, 0)
+        };
+
+    Amidakuji::new(diag_fn, circulant_pre_suf_fn, total_ratio_fn, least_fn, most_fn)
 }
