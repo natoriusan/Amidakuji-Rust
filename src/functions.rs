@@ -333,15 +333,15 @@ impl Amidakuji {
     }
 
     pub(crate) fn calculate(&self, vertical_range: impl Iterator<Item=u32> + Clone, max_statusbar_width: Option<u32>) -> AmidakujiResult {
-        self.calc(vertical_range, false, 1, max_statusbar_width)
+        self.calc(vertical_range, 1, max_statusbar_width)
     }
 
     pub(crate) fn calculate_parallel(&self, vertical_range: impl Iterator<Item=u32> + Clone, thread_max: usize, max_statusbar_width: Option<u32>) -> AmidakujiResult {
-        self.calc(vertical_range, true, thread_max, max_statusbar_width)
+        self.calc(vertical_range, thread_max, max_statusbar_width)
     }
     
-    fn calc(&self, vertical_range: impl Iterator<Item=u32> + Clone, parallel: bool, thread_max: usize, max_statusbar_width: Option<u32>) -> AmidakujiResult {
-        let mut results = Vec::new();
+    fn calc(&self, vertical_range: impl Iterator<Item=u32> + Clone, thread_max: usize, max_statusbar_width: Option<u32>) -> AmidakujiResult {
+        let vertical_range = vertical_range.sorted();
         let total_time = Instant::now();
         let mut handlers = Vec::new();
         let counter = Arc::new(Mutex::new(0));
@@ -353,112 +353,120 @@ impl Amidakuji {
         let least_fn = self.least_fn;
         let most_fn = self.most_fn;
         let finished = Arc::new(Mutex::new(false));
-        let thread_count = Arc::new(Mutex::new(0));
+        
+        let update_statusbar = {
+            let counter = counter.clone();
+            move || {
+                let counter = counter.lock().unwrap();
+                print!("\r[\x1b[32m{}\x1b[36m{}\x1b[0m] {:>02}:{:>02}", "#".repeat(*counter * max_statusbar_width / vertical_count), "-".repeat(max_statusbar_width - *counter * max_statusbar_width / vertical_count), total_time.elapsed().as_secs() / 60, total_time.elapsed().as_secs() % 60);
+                stdout().flush().unwrap();
+            }
+        };
+        
         let timer_handler = {
             let finished = finished.clone();
-            let counter = counter.clone();
+            let update_statusbar = update_statusbar.clone();
             thread::spawn(move || {
                 while !(*finished.lock().unwrap()) {
                     thread::sleep(Duration::from_millis(100));
-                    let counter = counter.lock().unwrap();
-                    print!("\r[\x1b[32m{}\x1b[36m{}\x1b[0m] {:>02}:{:>02}", "#".repeat(*counter * max_statusbar_width / vertical_count), "-".repeat(max_statusbar_width - *counter * max_statusbar_width / vertical_count), total_time.elapsed().as_secs() / 60, total_time.elapsed().as_secs() % 60);
-                    stdout().flush().unwrap();
+                    update_statusbar();
                 }
             })
         };
-        for vertical in vertical_range {
-            while *thread_count.lock().unwrap() >= thread_max {
-                thread::sleep(Duration::from_millis(100));
-            }
+        
+        let vertical_split =
+            vertical_range.enumerate()
+                .into_group_map_by(|(i, _)| i % thread_max)
+                .into_values()
+                .map(|x| x.into_iter().map(|(_, r)| r));
+        
+        for verticals in vertical_split {
             let counter = counter.clone();
-            *thread_count.lock().unwrap() += 1;
-            let thread_count = thread_count.clone();
+            let update_statusbar = update_statusbar.clone();
             handlers.push(thread::spawn(move || {
-                let time = Instant::now();
-                
-                let result =
-                    (0..)
-                        .map(|i| 2_u32.pow(i))
-                        .find_map(|precision| {
-                            let pre_suf_least = pre_suf_fn(vertical, least_fn(vertical).0, least_fn(vertical).1, precision)?;
-                            let pre_suf_most = pre_suf_fn(vertical, most_fn(vertical).0, most_fn(vertical).1, precision)?;
-                            let diag = diag_fn(vertical, precision)?;
-                            let total_ratio = total_ratio_fn(vertical, precision)?; // MinMaxBound::from_u32(m, precision)?; // MinMaxBound::new(Float::with_val_round(precision, m, Round::Down).0);
-                            let low_bound = MinMaxBound::from_u32(95, precision)?;
-                            let high_bound = MinMaxBound::from_u32(105, precision)?;
-                            let mid_mul = MinMaxBound::from_u32(100 * vertical, precision)?;
-                            
-                            let check_fairness = |most: MinMaxBound, least: MinMaxBound, total: &MinMaxBound| -> Option<bool> {
-                                fold(definitely_le((most * &mid_mul)?, (total.clone() * &high_bound)?), definitely_le((total.clone() * &low_bound)?, (least * &mid_mul)?))
-                            };
+                let mut last_precision = 0;
+                verticals.map(move |vertical| {
+                    let time = Instant::now();
+                    let result =
+                        (last_precision..)
+                            .map(|i| 2_u32.pow(i))
+                            .find_map(|precision| {
+                                last_precision = precision.ilog2();
+                                let pre_suf_least = pre_suf_fn(vertical, least_fn(vertical).0, least_fn(vertical).1, precision)?;
+                                let pre_suf_most = pre_suf_fn(vertical, most_fn(vertical).0, most_fn(vertical).1, precision)?;
+                                let diag = diag_fn(vertical, precision)?;
+                                let total_ratio = total_ratio_fn(vertical, precision)?;
+                                let low_bound = MinMaxBound::from_u32(95, precision)?;
+                                let high_bound = MinMaxBound::from_u32(105, precision)?;
+                                let mid_mul = MinMaxBound::from_u32(100 * vertical, precision)?;
 
-                            let (diag_powers, total_powers) = {
-                                let mut diag_powers = vec![diag];
-                                let mut total_powers = vec![total_ratio];
+                                let check_fairness = |most: MinMaxBound, least: MinMaxBound, total: &MinMaxBound| -> Option<bool> {
+                                    fold(definitely_le((most * &mid_mul)?, (total.clone() * &high_bound)?), definitely_le((total.clone() * &low_bound)?, (least * &mid_mul)?))
+                                };
 
-                                for index in 0.. {
-                                    if index >= 1 {
-                                        diag_powers.push((diag_powers[index-1].clone() * &diag_powers[index-1])?);
-                                        total_powers.push((total_powers[index-1].clone() * &total_powers[index-1])?);
+                                let (diag_powers, total_powers) = {
+                                    let mut diag_powers = vec![diag];
+                                    let mut total_powers = vec![total_ratio];
+
+                                    for index in 0.. {
+                                        if index >= 1 {
+                                            diag_powers.push((diag_powers[index - 1].clone() * &diag_powers[index - 1])?);
+                                            total_powers.push((total_powers[index - 1].clone() * &total_powers[index - 1])?);
+                                        }
+
+                                        let most = diag_powers[index].clone().inner_product(&pre_suf_most)?;
+                                        let least = diag_powers[index].clone().inner_product(&pre_suf_least)?;
+                                        let total = &total_powers[index];
+                                        let is_fair = check_fairness(most, least, total)?;
+                                        if is_fair {
+                                            break
+                                        }
                                     }
 
-                                    let most = diag_powers[index].clone().inner_product(&pre_suf_most)?;
-                                    let least = diag_powers[index].clone().inner_product(&pre_suf_least)?;
-                                    let total = &total_powers[index];
-                                    let is_fair = check_fairness(most, least, total)?;
-                                    if is_fair {
-                                        break
+                                    (diag_powers, total_powers)
+                                };
+
+
+                                let max_index = diag_powers.len() - 1;
+                                {
+                                    let mut n = 0;
+                                    let mut last_diag = Vector::identity(vertical, precision)?;
+                                    let mut last_total = MinMaxBound::identity(precision)?;
+                                    for index in (0..max_index).rev() {
+                                        let next_diag = (last_diag.clone() * &diag_powers[index])?;
+                                        let next_total = (last_total.clone() * &total_powers[index])?;
+
+                                        let most = next_diag.clone().inner_product(&pre_suf_most)?;
+                                        let least = next_diag.clone().inner_product(&pre_suf_least)?;
+                                        let total = &next_total;
+
+                                        let is_fair = check_fairness(most, least, total)?;
+
+                                        if !is_fair {
+                                            n |= 2_u64.pow(index as u32);
+                                            last_diag = next_diag;
+                                            last_total = next_total;
+                                        }
                                     }
+
+                                    Some(n + 1)
                                 }
+                            }).unwrap();
 
-                                (diag_powers, total_powers)
-                            };
-                            
-                            
-                            let max_index = diag_powers.len() - 1;
-                            {
-                                let mut n = 0;
-                                let mut last_diag = Vector::identity(vertical, precision)?;
-                                let mut last_total = MinMaxBound::identity(precision)?;
-                                for index in (0..max_index).rev() {
-                                    let next_diag = (last_diag.clone() * &diag_powers[index])?;
-                                    let next_total = (last_total.clone() * &total_powers[index])?;
-
-                                    let most = next_diag.clone().inner_product(&pre_suf_most)?;
-                                    let least = next_diag.clone().inner_product(&pre_suf_least)?;
-                                    let total = &next_total;
-                                    
-                                    let is_fair = check_fairness(most, least, total)?;
-
-                                    if !is_fair {
-                                        n |= 2_u64.pow(index as u32);
-                                        last_diag = next_diag;
-                                        last_total = next_total;
-                                    }
-                                }
-
-                                Some(n + 1)
-                            }
-                        }).unwrap();
-                
-                let mut counter = counter.lock().unwrap();
-                *counter += 1;
-                *thread_count.lock().unwrap() -= 1;
-                print!("\r[\x1b[32m{}\x1b[36m{}\x1b[0m] {:>02}:{:>02}", "#".repeat(*counter * max_statusbar_width / vertical_count), "-".repeat(max_statusbar_width - *counter * max_statusbar_width / vertical_count), total_time.elapsed().as_secs() / 60, total_time.elapsed().as_secs() % 60);
-                stdout().flush().unwrap();
-                (vertical, result, time.elapsed())
-            }));
-            if !parallel {
-                results.push(handlers.into_iter().last().unwrap().join().unwrap());
-                handlers = Vec::new();
-            }
+                    let mut counter = counter.lock().unwrap();
+                    *counter += 1;
+                    drop(counter);
+                    update_statusbar();
+                    (vertical, result, time.elapsed())
+                }).collect_vec()
+            }))
         }
-
-        if parallel {
-            for handler in handlers {
-                results.push(handler.join().unwrap());
-            }
-        }
+        
+        let results =
+            handlers.into_iter()
+                .flat_map(|handler| handler.join().unwrap())
+                .sorted()
+                .collect_vec();
         
         *finished.lock().unwrap() = true;
         timer_handler.join().unwrap();
